@@ -1,10 +1,9 @@
 """
-Keyword Monitor (Security & Administrative Filtered)
----------------------------------------------------
-Checks Google News RSS for a set of target keywords specifically scoped to
-security and administrative topics. Sends a push notification (via ntfy.sh)
-for new matching articles. If nothing new is found, sends a low-priority
-heartbeat notification.
+Keyword Monitor
+---------------
+Checks Google News RSS for a set of keywords for articles published in the last 24 hours.
+Sends a push notification (via ntfy.sh) for any new matching articles. If nothing new is found,
+it sends a low-priority "heartbeat" notification ("No new updates").
 
 Requires only the Python standard library (no pip install step needed).
 Expects the NTFY_TOPIC environment variable.
@@ -19,7 +18,6 @@ import urllib.error
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
-# Target location and organization keywords
 KEYWORDS = [
     "CISF",
     "SILIGURI CORRIDOR",
@@ -30,12 +28,6 @@ KEYWORDS = [
     "NHPC",
 ]
 
-# Query filter enforcing security & administrative relevance
-SECURITY_ADMIN_FILTER = (
-    "security OR administration OR police OR deployment OR "
-    '"law and order" OR border OR intelligence OR government OR "district magistrate"'
-)
-
 STATE_FILE = "state.json"
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC")
 NTFY_URL = f"https://ntfy.sh/{NTFY_TOPIC}" if NTFY_TOPIC else None
@@ -45,7 +37,7 @@ SECONDS_BETWEEN_NOTIFICATIONS = 3       # Rate limit buffer for ntfy.sh
 
 
 def load_state():
-    """Loads state.json, returning stored list of seen identifiers."""
+    """Loads state.json, preserving stored list order."""
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -64,12 +56,11 @@ def save_state(seen_links_list):
 
 def fetch_news(keyword):
     """
-    Fetches Google News RSS items for a keyword filtered strictly by security
-    and administrative terms.
+    Fetches RSS results for a keyword, restricted to recent news (past 24 hours)
+    using Google News search operator 'when:1d'.
     """
-    full_query = f'"{keyword}" ({SECURITY_ADMIN_FILTER})'
-    query_encoded = urllib.parse.quote(full_query)
-    url = f"https://news.google.com/rss/search?q={query_encoded}&hl=en-IN&gl=IN&ceid=IN:en"
+    query = urllib.parse.quote(f'"{keyword}" when:1d')
+    url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
     
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     
@@ -88,7 +79,7 @@ def fetch_news(keyword):
 
 
 def send_notification(title, message, priority="default", tags="", retries=3):
-    """Sends push notification via ntfy.sh with retry logic for rate limits."""
+    """Sends a push notification via ntfy.sh with exponential backoff on HTTP 429."""
     if not NTFY_URL:
         print(f"NTFY_TOPIC not set. Skipping notification:\n[{title}]\n{message}")
         return
@@ -123,7 +114,7 @@ def send_notification(title, message, priority="default", tags="", retries=3):
 def main():
     state = load_state()
     
-    # Maintain list for chronological ordering and set for O(1) deduplication
+    # Maintain ordered list for persistence and set for O(1) deduplication
     seen_links_list = state.get("seen_links", [])
     seen_set = set(seen_links_list)
     
@@ -154,24 +145,24 @@ def main():
                 
                 message = "\n".join(lines)
                 send_notification(
-                    f"{kw} [Security/Admin] ({len(items)} new)",
+                    f"{kw} ({len(items)} new)",
                     message,
                     priority="high",
-                    tags="shield,bell",
+                    tags="bell",
                 )
                 print(f"Sent digest for '{kw}': {len(items)} new item(s)")
                 time.sleep(SECONDS_BETWEEN_NOTIFICATIONS)
         else:
             now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
             send_notification(
-                "Keyword Monitor: No new security/admin alerts",
+                "Keyword Monitor: No new updates",
                 f"Checked at {now}. No new matches.",
                 priority="min",
                 tags="white_check_mark",
             )
             print("No new items found. Sent heartbeat notification.")
     finally:
-        # Preserve actual state progression on disk
+        # Save progress while respecting real chronological order
         save_state(seen_links_list)
 
 
