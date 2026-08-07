@@ -1,10 +1,12 @@
 """
 Keyword Monitor
 ---------------
-Checks Google News RSS for a set of keywords for articles published in the last 24 hours.
-Sends push notifications (via ntfy.sh) containing ALL new matching articles without capping.
-If a keyword has many articles, it automatically splits them across multiple notifications 
-so no links are truncated. If no new updates are found, sends a low-priority heartbeat.
+Checks Google News RSS for a set of keywords individually. 
+
+For each keyword:
+- If new articles are found, it sends a high-priority notification with ALL links.
+- If no new articles are found, it sends a low-priority notification specifically 
+  for that keyword stating "No new updates since last run".
 
 Requires only the Python standard library (no pip install step needed).
 Expects the NTFY_TOPIC environment variable.
@@ -34,7 +36,7 @@ NTFY_TOPIC = os.environ.get("NTFY_TOPIC")
 NTFY_URL = f"https://ntfy.sh/{NTFY_TOPIC}" if NTFY_TOPIC else None
 
 SECONDS_BETWEEN_NOTIFICATIONS = 3       # Rate limit buffer for ntfy.sh
-MAX_PAYLOAD_BYTES = 3500                 # Safe limit per ntfy message (ntfy limit is ~4096 bytes)
+MAX_PAYLOAD_BYTES = 3500                 # Safe limit per ntfy message (~4096 max)
 
 
 def load_state():
@@ -56,11 +58,8 @@ def save_state(seen_links_list):
 
 
 def fetch_news(keyword):
-    """
-    Fetches RSS results for a keyword, restricted to recent news (past 24 hours)
-    using Google News search operator 'when:1d'.
-    """
-    query = urllib.parse.quote(f'"{keyword}" when:1d')
+    """Fetches RSS results for a keyword using Google News RSS search."""
+    query = urllib.parse.quote(keyword)
     url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
     
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -80,7 +79,7 @@ def fetch_news(keyword):
 
 
 def send_notification(title, message, priority="default", tags="", retries=3):
-    """Sends a push notification via ntfy.sh with exponential backoff on HTTP 429."""
+    """Sends a push notification via ntfy.sh with retry logic for 429 rate limits."""
     if not NTFY_URL:
         print(f"NTFY_TOPIC not set. Skipping notification:\n[{title}]\n{message}")
         return
@@ -115,17 +114,16 @@ def send_notification(title, message, priority="default", tags="", retries=3):
 def send_keyword_digest(kw, items):
     """
     Formats and sends ALL items for a keyword. If total text size exceeds 
-    MAX_PAYLOAD_BYTES, splits into multiple numbered messages so no links are lost.
+    MAX_PAYLOAD_BYTES, automatically splits into numbered messages (Part 1/2, etc.).
     """
     formatted_items = [f"{i+1}. {title}\n{link}" for i, (title, link) in enumerate(items)]
     
-    # Group items into chunks that fit within ntfy payload byte limits
     chunks = []
     current_chunk = []
     current_length = 0
 
     for item_str in formatted_items:
-        item_bytes = len(item_str.encode("utf-8")) + 2  # +2 for double newline separator
+        item_bytes = len(item_str.encode("utf-8")) + 2  # +2 for double newline
         if current_chunk and (current_length + item_bytes > MAX_PAYLOAD_BYTES):
             chunks.append(current_chunk)
             current_chunk = [item_str]
@@ -156,11 +154,9 @@ def send_keyword_digest(kw, items):
 def main():
     state = load_state()
     
-    # Maintain ordered list for persistence and set for O(1) deduplication
     seen_links_list = state.get("seen_links", [])
     seen_set = set(seen_links_list)
-    
-    new_by_keyword = {}
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     try:
         for kw in KEYWORDS:
@@ -168,29 +164,30 @@ def main():
                 articles = fetch_news(kw)
             except Exception as e:
                 print(f"Error fetching RSS for '{kw}': {e}")
-                continue
+                articles = []
 
+            new_items = []
             for title, link, guid in articles:
                 item_id = guid if guid else link
                 if item_id not in seen_set:
-                    new_by_keyword.setdefault(kw, []).append((title, link))
+                    new_items.append((title, link))
                     seen_set.add(item_id)
                     seen_links_list.append(item_id)
 
-        if new_by_keyword:
-            for kw, items in new_by_keyword.items():
-                send_keyword_digest(kw, items)
-        else:
-            now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-            send_notification(
-                "Keyword Monitor: No new updates",
-                f"Checked at {now}. No new matches.",
-                priority="min",
-                tags="white_check_mark",
-            )
-            print("No new items found. Sent heartbeat notification.")
+            if new_items:
+                send_keyword_digest(kw, new_items)
+            else:
+                # Send separate "No updates" notification for this specific keyword
+                send_notification(
+                    f"{kw}: No new updates",
+                    f"Checked at {now}. No new articles found since last run.",
+                    priority="min",
+                    tags="white_check_mark",
+                )
+                print(f"No new items for '{kw}'. Sent separate heartbeat.")
+                time.sleep(SECONDS_BETWEEN_NOTIFICATIONS)
+
     finally:
-        # Save progress while respecting real chronological order
         save_state(seen_links_list)
 
 
