@@ -1,0 +1,38 @@
+name: Keyword Monitor
+
+on:
+  schedule:
+    # Cron is in UTC. IST = UTC+5:30.
+    # 10:00 IST -> 04:30 UTC
+    # 20:00 IST -> 14:30 UTC
+    - cron: "30 4 * * *"
+    - cron: "30 14 * * *"
+  workflow_dispatch: {}   # lets you manually trigger a run from the Actions tab
+
+permissions:
+  contents: write   # needed so the workflow can commit updated state.json back
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run keyword monitor
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python3 monitor.py
+
+      - name: Commit updated state
+        run: |
+          git config user.name "keyword-monitor-bot"
+          git config user.email "actions@github.com"
+          git add state.json
+          git diff --staged --quiet || git commit -m "Update seen-articles state [skip ci]"
+          git push
