@@ -2,8 +2,9 @@
 Keyword Monitor
 ---------------
 Checks Google News RSS for a set of keywords for articles published in the last 24 hours.
-Sends a push notification (via ntfy.sh) for any new matching articles. If nothing new is found,
-it sends a low-priority "heartbeat" notification ("No new updates").
+Sends push notifications (via ntfy.sh) containing ALL new matching articles without capping.
+If a keyword has many articles, it automatically splits them across multiple notifications 
+so no links are truncated. If no new updates are found, sends a low-priority heartbeat.
 
 Requires only the Python standard library (no pip install step needed).
 Expects the NTFY_TOPIC environment variable.
@@ -32,8 +33,8 @@ STATE_FILE = "state.json"
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC")
 NTFY_URL = f"https://ntfy.sh/{NTFY_TOPIC}" if NTFY_TOPIC else None
 
-MAX_ITEMS_PER_KEYWORD_NOTIFICATION = 5  # Cap items per notification digest
 SECONDS_BETWEEN_NOTIFICATIONS = 3       # Rate limit buffer for ntfy.sh
+MAX_PAYLOAD_BYTES = 3500                 # Safe limit per ntfy message (ntfy limit is ~4096 bytes)
 
 
 def load_state():
@@ -111,6 +112,47 @@ def send_notification(title, message, priority="default", tags="", retries=3):
             return
 
 
+def send_keyword_digest(kw, items):
+    """
+    Formats and sends ALL items for a keyword. If total text size exceeds 
+    MAX_PAYLOAD_BYTES, splits into multiple numbered messages so no links are lost.
+    """
+    formatted_items = [f"{i+1}. {title}\n{link}" for i, (title, link) in enumerate(items)]
+    
+    # Group items into chunks that fit within ntfy payload byte limits
+    chunks = []
+    current_chunk = []
+    current_length = 0
+
+    for item_str in formatted_items:
+        item_bytes = len(item_str.encode("utf-8")) + 2  # +2 for double newline separator
+        if current_chunk and (current_length + item_bytes > MAX_PAYLOAD_BYTES):
+            chunks.append(current_chunk)
+            current_chunk = [item_str]
+            current_length = item_bytes
+        else:
+            current_chunk.append(item_str)
+            current_length += item_bytes
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    total_chunks = len(chunks)
+    for idx, chunk in enumerate(chunks, 1):
+        part_suffix = f" (Part {idx}/{total_chunks})" if total_chunks > 1 else ""
+        title = f"{kw} ({len(items)} new){part_suffix}"
+        message = "\n\n".join(chunk)
+        
+        send_notification(
+            title,
+            message,
+            priority="high",
+            tags="bell",
+        )
+        print(f"Sent digest for '{kw}'{part_suffix}: {len(chunk)} item(s)")
+        time.sleep(SECONDS_BETWEEN_NOTIFICATIONS)
+
+
 def main():
     state = load_state()
     
@@ -137,21 +179,7 @@ def main():
 
         if new_by_keyword:
             for kw, items in new_by_keyword.items():
-                shown = items[:MAX_ITEMS_PER_KEYWORD_NOTIFICATION]
-                lines = [f"- {title}\n  {link}" for title, link in shown]
-                extra = len(items) - len(shown)
-                if extra > 0:
-                    lines.append(f"...and {extra} more")
-                
-                message = "\n".join(lines)
-                send_notification(
-                    f"{kw} ({len(items)} new)",
-                    message,
-                    priority="high",
-                    tags="bell",
-                )
-                print(f"Sent digest for '{kw}': {len(items)} new item(s)")
-                time.sleep(SECONDS_BETWEEN_NOTIFICATIONS)
+                send_keyword_digest(kw, items)
         else:
             now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
             send_notification(
