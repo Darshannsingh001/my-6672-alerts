@@ -6,14 +6,20 @@ Checks Google News RSS for a set of keywords, and sends a push notification
 sends a low-priority "heartbeat" notification so you know the job is still
 running correctly.
 
+New articles are batched into ONE digest notification per keyword per run
+(capped, with a "+N more" note) rather than one notification per article —
+this avoids ntfy's rate limits and avoids spamming your phone.
+
 Requires only the Python standard library (no pip install step needed).
 Expects the NTFY_TOPIC environment variable (set as a GitHub secret).
 """
 
 import json
 import os
+import time
 import urllib.request
 import urllib.parse
+import urllib.error
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
@@ -30,6 +36,9 @@ KEYWORDS = [
 STATE_FILE = "state.json"
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC")
 NTFY_URL = f"https://ntfy.sh/{NTFY_TOPIC}" if NTFY_TOPIC else None
+
+MAX_ITEMS_PER_KEYWORD_NOTIFICATION = 5  # avoid huge/spammy messages
+SECONDS_BETWEEN_NOTIFICATIONS = 3       # stay well under ntfy's rate limit
 
 
 def load_state():
@@ -59,17 +68,11 @@ def fetch_news(keyword):
     return items
 
 
-def send_notification(title, message, priority="default", tags=""):
+def send_notification(title, message, priority="default", tags="", retries=3):
     if not NTFY_URL:
         print("NTFY_TOPIC not set, skipping notification. Message:", title, message)
         return
-    # HTTP headers must be Latin-1 safe, so ASCII-only text goes in headers.
-    # Emoji/icons are added via the "Tags" header instead, which ntfy renders
-    # as emoji automatically (see https://docs.ntfy.sh/publish/#tags-emojis).
-    headers = {
-        "Title": title,
-        "Priority": priority,
-    }
+    headers = {"Title": title, "Priority": priority}
     if tags:
         headers["Tags"] = tags
     req = urllib.request.Request(
@@ -78,41 +81,70 @@ def send_notification(title, message, priority="default", tags=""):
         headers=headers,
         method="POST",
     )
-    urllib.request.urlopen(req, timeout=20)
+    for attempt in range(1, retries + 1):
+        try:
+            urllib.request.urlopen(req, timeout=20)
+            return
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < retries:
+                wait = 10 * attempt
+                print(f"Rate limited (429), waiting {wait}s before retry...")
+                time.sleep(wait)
+                continue
+            print(f"Failed to send notification '{title}': {e}")
+            return
+        except Exception as e:
+            print(f"Failed to send notification '{title}': {e}")
+            return
 
 
 def main():
     state = load_state()
     seen = set(state.get("seen_links", []))
-    new_items = []
+    new_by_keyword = {}
 
-    for kw in KEYWORDS:
-        try:
-            articles = fetch_news(kw)
-        except Exception as e:
-            print(f"Error fetching for '{kw}': {e}")
-            continue
-        for title, link in articles:
-            if link not in seen:
-                new_items.append((kw, title, link))
-                seen.add(link)
+    try:
+        for kw in KEYWORDS:
+            try:
+                articles = fetch_news(kw)
+            except Exception as e:
+                print(f"Error fetching for '{kw}': {e}")
+                continue
+            for title, link in articles:
+                if link not in seen:
+                    new_by_keyword.setdefault(kw, []).append((title, link))
+                    seen.add(link)
 
-    if new_items:
-        for kw, title, link in new_items:
-            send_notification(kw, f"{title}\n{link}", priority="high", tags="bell")
-            print("Sent alert:", kw, "-", title)
-    else:
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        send_notification(
-            "Keyword Monitor: No new alerts",
-            f"Checked at {now}. No new matches.",
-            priority="min",
-            tags="white_check_mark",
-        )
-        print("No new items found. Sent heartbeat notification.")
-
-    state["seen_links"] = list(seen)[-2000:]  # keep state file bounded
-    save_state(state)
+        if new_by_keyword:
+            for kw, items in new_by_keyword.items():
+                shown = items[:MAX_ITEMS_PER_KEYWORD_NOTIFICATION]
+                lines = [f"- {title}\n  {link}" for title, link in shown]
+                extra = len(items) - len(shown)
+                if extra > 0:
+                    lines.append(f"...and {extra} more")
+                message = "\n".join(lines)
+                send_notification(
+                    f"{kw} ({len(items)} new)",
+                    message,
+                    priority="high",
+                    tags="bell",
+                )
+                print(f"Sent digest for '{kw}': {len(items)} new item(s)")
+                time.sleep(SECONDS_BETWEEN_NOTIFICATIONS)
+        else:
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            send_notification(
+                "Keyword Monitor: No new alerts",
+                f"Checked at {now}. No new matches.",
+                priority="min",
+                tags="white_check_mark",
+            )
+            print("No new items found. Sent heartbeat notification.")
+    finally:
+        # Always save progress, even if a notification failed partway through,
+        # so we never re-send the same articles on the next run.
+        state["seen_links"] = list(seen)[-3000:]
+        save_state(state)
 
 
 if __name__ == "__main__":
