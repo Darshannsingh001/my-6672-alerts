@@ -1,0 +1,17 @@
+  - name: Set up Python
+    uses: actions/setup-python@v5
+    with:
+      python-version: "3.11"
+
+  - name: Run keyword monitor
+    env:
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+    run: python3 monitor.py
+
+  - name: Commit updated state
+    run: |
+      git config user.name "keyword-monitor-bot"
+      git config user.email "actions@github.com"
+      git add state.json
+      git diff --staged --quiet || git commit -m "Update seen-articles state [skip ci]"
+      git push
