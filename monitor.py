@@ -59,14 +59,23 @@ def fetch_news(keyword):
     return items
 
 
-def send_notification(title, message, priority="default"):
+def send_notification(title, message, priority="default", tags=""):
     if not NTFY_URL:
         print("NTFY_TOPIC not set, skipping notification. Message:", title, message)
         return
+    # HTTP headers must be Latin-1 safe, so ASCII-only text goes in headers.
+    # Emoji/icons are added via the "Tags" header instead, which ntfy renders
+    # as emoji automatically (see https://docs.ntfy.sh/publish/#tags-emojis).
+    headers = {
+        "Title": title,
+        "Priority": priority,
+    }
+    if tags:
+        headers["Tags"] = tags
     req = urllib.request.Request(
         NTFY_URL,
         data=message.encode("utf-8"),
-        headers={"Title": title, "Priority": priority},
+        headers=headers,
         method="POST",
     )
     urllib.request.urlopen(req, timeout=20)
@@ -90,7 +99,7 @@ def main():
 
     if new_items:
         for kw, title, link in new_items:
-            send_notification(f"\U0001F514 {kw}", f"{title}\n{link}", priority="high")
+            send_notification(kw, f"{title}\n{link}", priority="high", tags="bell")
             print("Sent alert:", kw, "-", title)
     else:
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -98,6 +107,7 @@ def main():
             "Keyword Monitor: No new alerts",
             f"Checked at {now}. No new matches.",
             priority="min",
+            tags="white_check_mark",
         )
         print("No new items found. Sent heartbeat notification.")
 
