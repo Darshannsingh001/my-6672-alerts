@@ -1,7 +1,7 @@
 name: Keyword Monitor Watchdog
 on:
   schedule:
-    - cron: "0 3 * * *"   # ~08:30 IST — timing doesn't need to be exact
+    - cron: "30 4 * * *"   # ~10:00 IST — safely between your two run times, timing doesn't need to be exact
   workflow_dispatch: {}
 jobs:
   watchdog:
@@ -26,7 +26,7 @@ jobs:
           NOW=$(date -u +%s)
           DIFF=$(( (NOW - LAST) / 3600 ))
           echo "Hours since last successful run: $DIFF"
-          if [ "$DIFF" -gt 16 ]; then
+          if [ "$DIFF" -gt 21 ]; then
             curl -d "Keyword Monitor watchdog: no successful run in $DIFF hours. Check cron-job.org and GitHub Actions." \
               -H "Title: Keyword Monitor ALERT" \
               -H "Priority: high" \
