@@ -9,6 +9,9 @@ Features:
 - Automatically splits long messages into chunks (Part 1/2, etc.) so no links are truncated.
 - Keywords WITHOUT new articles are combined into a single low-priority summary notification at the end.
 - Preserves up to 3,000 seen article identifiers in state.json to eliminate duplicate notifications.
+- Exits non-zero if EVERY keyword fails to fetch (e.g. RSS endpoint down/blocked), so the
+  GitHub Actions run is marked failed, the heartbeat step is skipped, and the watchdog
+  workflow can catch the outage instead of silently reporting success.
 
 Requires only the Python standard library.
 Expects the NTFY_TOPIC environment variable.
@@ -17,11 +20,13 @@ Expects the NTFY_TOPIC environment variable.
 import email.utils
 import json
 import os
+import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
 KEYWORDS = [
@@ -68,7 +73,7 @@ def fetch_news(keyword):
 
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
 
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urllib.request.urlopen(req, timeout=10) as resp:
         data = resp.read()
 
     root = ET.fromstring(data)
@@ -181,15 +186,30 @@ def main():
     seen_set = set(seen_links_list)
 
     quiet_keywords = []
+    failed_keywords = []
 
     try:
-        for kw in KEYWORDS:
-            try:
-                articles = fetch_news(kw)
-            except Exception as e:
-                print(f"Error fetching RSS for '{kw}': {e}")
-                articles = []
+        # Fetch all keywords in parallel instead of one-by-one. Sequential fetches meant
+        # a totally healthy "no updates" run still paid the sum of 7 network round-trips;
+        # running them concurrently means total fetch time is roughly the slowest single
+        # request instead of the sum of all of them.
+        results = {}
+        with ThreadPoolExecutor(max_workers=len(KEYWORDS)) as executor:
+            future_to_kw = {executor.submit(fetch_news, kw): kw for kw in KEYWORDS}
+            for future in as_completed(future_to_kw):
+                kw = future_to_kw[future]
+                try:
+                    results[kw] = future.result()
+                except Exception as e:
+                    print(f"Error fetching RSS for '{kw}': {e}")
+                    results[kw] = []
+                    failed_keywords.append(kw)
 
+        # Process results (and send notifications) in the original keyword order,
+        # sequentially — notification sending still has a deliberate rate-limit sleep,
+        # so it stays outside the parallel section.
+        for kw in KEYWORDS:
+            articles = results.get(kw, [])
             new_items = []
             for title, link, guid in articles:
                 item_id = guid if guid else link
@@ -219,6 +239,22 @@ def main():
 
     finally:
         save_state(seen_links_list)
+
+    # If every single keyword failed to fetch, this run didn't actually check anything
+    # useful (e.g. Google News RSS is down/blocked/rate-limiting us). Fail loudly so the
+    # GitHub Actions step is marked failed, the heartbeat step is skipped, and the
+    # watchdog workflow can alert on it instead of silently reporting a healthy run.
+    if failed_keywords and len(failed_keywords) == len(KEYWORDS):
+        print(
+            f"FATAL: all {len(KEYWORDS)} keyword fetches failed this run: "
+            f"{', '.join(failed_keywords)}"
+        )
+        sys.exit(1)
+    elif failed_keywords:
+        print(
+            f"Warning: {len(failed_keywords)} of {len(KEYWORDS)} keyword fetches "
+            f"failed this run: {', '.join(failed_keywords)}"
+        )
 
 
 if __name__ == "__main__":
